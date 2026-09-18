@@ -1,0 +1,183 @@
+name: Run ephemeral smoke tests
+
+# Reusable workflow: submits a run of the `smoke-tests` Argo WorkflowTemplate
+# (installed by notifynl-charts-private's notifynl-full chart) against the
+# shared notifynl-test cluster, waits for it to finish, then downloads and
+# publishes its artifacts. Called from notifynl-admin's and notifynl-api's
+# own pr.yml after their `deploy` job, via `secrets: inherit` -- same
+# pattern the old Cypress e2e-smoke-test.yml reusable workflow used.
+#
+# See the ephemeral-test-fixtures plan (notifynl-devcontainer meta-repo) for
+# the full design and why each piece here is shaped the way it is -- in
+# particular: `argo submit --from workflowtemplate/<name>` and `argo stop`
+# (never `argo terminate`) were both verified against a real cluster before
+# being used here, not assumed from documentation.
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Which Playwright project to run ("admin" or "api")
+        required: true
+        type: string
+      image-tag:
+        description: notifynl-smoke-tests image tag to run (testRevision)
+        required: false
+        type: string
+        default: latest
+      namespace:
+        description: Cluster namespace both the app and Argo Workflows execute in
+        required: false
+        type: string
+        default: notifynl-test
+      argo-version:
+        description: Argo CLI version to install (must match the cluster's installed version)
+        required: false
+        type: string
+        default: "3.6.2"
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+
+    steps:
+      # K8S_CONFIG is the same base64-encoded kubeconfig secret the calling
+      # workflow's own `deploy` job already used via azure/k8s-set-context --
+      # reused here rather than minting a separate credential, since it
+      # already carries exactly the RBAC this job needs (create/get on
+      # workflows.argoproj.io in this namespace).
+      - name: Decode kubeconfig
+        id: decode-kubeconfig
+        run: |
+          {
+            echo "content<<KUBECONFIG_EOF"
+            echo "${{ secrets.K8S_CONFIG }}" | base64 -d
+            echo "KUBECONFIG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ steps.decode-kubeconfig.outputs.content }}
+
+      - name: Install argo CLI
+        run: |
+          set -euo pipefail
+          curl -sL "https://github.com/argoproj/argo-workflows/releases/download/v${{ inputs.argo-version }}/argo-linux-amd64.gz" -o argo.gz
+          gunzip argo.gz
+          chmod +x argo
+          sudo mv argo /usr/local/bin/argo
+          argo version --short
+
+      - name: Submit smoke-tests workflow
+        id: submit
+        run: |
+          set -euo pipefail
+          argo submit --from workflowtemplate/smoke-tests \
+            -n ${{ inputs.namespace }} \
+            --parameter runId=${{ github.run_id }}-${{ github.run_attempt }} \
+            --parameter project=${{ inputs.project }} \
+            --parameter testRevision=${{ inputs.image-tag }} \
+            -o name > wf-name.txt
+          echo "name=$(cat wf-name.txt)" >> "$GITHUB_OUTPUT"
+
+      # Polls rather than an unverified --wait/-f convenience flag -- this
+      # exact `argo get -o json` pattern is what every spike in the plan
+      # (A1-A6, B1-B2) was itself verified through.
+      - name: Wait for workflow to finish
+        id: wait
+        run: |
+          set -euo pipefail
+          name="${{ steps.submit.outputs.name }}"
+          for i in $(seq 1 180); do
+            phase=$(argo get "$name" -n ${{ inputs.namespace }} -o json | jq -r '.status.phase // "Unknown"')
+            echo "poll $i: phase=$phase"
+            if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ] || [ "$phase" = "Error" ]; then
+              echo "phase=$phase" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Timed out waiting for workflow $name to finish"
+          echo "phase=Timeout" >> "$GITHUB_OUTPUT"
+
+      # Cancellation must call `argo stop`, never `argo terminate` --
+      # verified directly (see the plan's B2): `argo terminate` skips
+      # `onExit` entirely and leaks the fixture; `argo stop` runs it to
+      # completion. Runs whenever this job itself is being cancelled
+      # (workflow_call inherits the caller's `cancel-in-progress` concurrency
+      # group), regardless of how the wait step above ended.
+      - name: Stop workflow on cancellation
+        if: cancelled() && steps.submit.outputs.name != ''
+        run: argo stop "${{ steps.submit.outputs.name }}" -n ${{ inputs.namespace }} || true
+
+      # Same AWS credentials notifynl-full's bucket-provision-job.yaml
+      # already uses to create this bucket in the first place (and that
+      # notifynl-admin's update-static.yml already uses from GitHub Actions
+      # for a different bucket) -- one AWS identity for this org's S3 needs,
+      # not a separate one minted just for this download step.
+      - name: Download artifacts from S3
+        if: always() && steps.submit.outputs.name != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: eu-central-1
+        run: |
+          set -euo pipefail
+          name="${{ steps.submit.outputs.name }}"
+          bucket="${{ vars.SMOKE_TEST_ARTIFACTS_BUCKET }}"
+          mkdir -p results
+
+          # The exact S3 key for each artifact -- read from the finished
+          # workflow's own status rather than assuming a key-format pattern
+          # (that's set cluster-side by the argo namespace's
+          # workflow-controller-configmap and not something this job should
+          # need to know in advance).
+          argo get "$name" -n ${{ inputs.namespace }} -o json > wf.json
+          download_artifact() {
+            # $1 = artifact name, $2 = extraction dir. junit's tarball
+            # contains a flat junit.xml (its source, /app/test-results/
+            # junit.xml, is a single file); playwright-report's tarball
+            # already contains its own top-level playwright-report/
+            # directory (its source is a directory) -- confirmed against a
+            # real artifact round-trip during the plan's A4 spike, so these
+            # extract into different-shaped destinations, not the same one.
+            key=$(jq -r --arg name "$1" \
+              '.status.nodes[]? | select(.outputs.artifacts != null) | .outputs.artifacts[]? | select(.name == $name) | .s3.key // empty' \
+              wf.json | head -1)
+            if [ -z "$key" ]; then
+              echo "::warning::No $1 artifact found on workflow $name -- it may have failed before producing one"
+              return
+            fi
+            aws s3 cp "s3://$bucket/$key" "$1.tgz"
+            mkdir -p "$2"
+            tar xzf "$1.tgz" -C "$2"
+          }
+          mkdir -p results/junit
+          download_artifact junit results/junit
+          download_artifact playwright-report results
+
+      - uses: dorny/test-reporter@v2
+        if: always()
+        with:
+          name: Smoke tests (${{ inputs.project }})
+          path: results/junit/*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-${{ inputs.project }}
+          path: results/playwright-report/**
+          retention-days: 7
+
+      - name: Fail the job if the smoke tests didn't succeed
+        if: steps.wait.outputs.phase != 'Succeeded'
+        run: |
+          echo "::error::Smoke tests did not succeed (phase: ${{ steps.wait.outputs.phase }})"
+          exit 1
