@@ -4,8 +4,15 @@ name: Run ephemeral smoke tests
 # (installed by notifynl-charts-private's notifynl-full chart) against the
 # shared notifynl-test cluster, waits for it to finish, then downloads and
 # publishes its artifacts. Called from notifynl-admin's and notifynl-api's
-# own pr.yml after their `deploy` job, via `secrets: inherit` -- same
-# pattern the old Cypress e2e-smoke-test.yml reusable workflow used.
+# own pr.yml after their `deploy` job -- same pattern the old Cypress
+# e2e-smoke-test.yml reusable workflow used.
+#
+# Credentials reach this workflow two different ways, and both are required:
+# `secrets: inherit` on the calling job passes org- and repo-level secrets,
+# but K8S_CONFIG and NAMESPACE are environment-scoped (they live on the
+# caller's `Test` environment) and `inherit` does not cover those -- they
+# resolve only because the job below binds itself to that environment via
+# the `environment` input.
 #
 # See the ephemeral-test-fixtures plan (notifynl-devcontainer meta-repo) for
 # the full design and why each piece here is shaped the way it is -- in
@@ -26,25 +33,52 @@ on:
         type: string
         default: latest
       namespace:
-        description: Cluster namespace both the app and Argo Workflows execute in
+        description: >-
+          Cluster namespace both the app and Argo Workflows execute in.
+          Defaults to the caller environment's NAMESPACE variable.
         required: false
         type: string
-        default: notifynl-test
+        default: ""
       argo-version:
         description: Argo CLI version to install (must match the cluster's installed version)
         required: false
         type: string
         default: "3.6.2"
+      environment:
+        description: Caller environment whose secrets and vars this job reads
+        required: false
+        type: string
+        default: Test
 
 jobs:
   smoke-test:
     runs-on: ubuntu-latest
+    # Binds the job to the caller's environment so it can read that
+    # environment's secrets and variables. Both K8S_CONFIG and NAMESPACE live
+    # on notifynl-api's and notifynl-admin's `Test` environment, and
+    # `secrets: inherit` passes only org- and repo-level secrets -- never
+    # environment-scoped ones.
+    environment:
+      name: ${{ inputs.environment }}
+    env:
+      NAMESPACE: ${{ inputs.namespace || vars.NAMESPACE }}
     permissions:
       contents: read
       checks: write
       pull-requests: write
 
     steps:
+      # argo treats -n "" as the default namespace rather than erroring, so an
+      # unresolved namespace would silently run against the wrong one -- fail
+      # here instead.
+      - name: Resolve namespace
+        run: |
+          if [ -z "$NAMESPACE" ]; then
+            echo "::error::No namespace resolved -- pass the 'namespace' input, or define a NAMESPACE variable on the '${{ inputs.environment }}' environment"
+            exit 1
+          fi
+          echo "Targeting namespace: $NAMESPACE"
+
       # K8S_CONFIG is the same base64-encoded kubeconfig secret the calling
       # workflow's own `deploy` job already used via azure/k8s-set-context --
       # reused here rather than minting a separate credential, since it
@@ -78,7 +112,7 @@ jobs:
         run: |
           set -euo pipefail
           argo submit --from workflowtemplate/smoke-tests \
-            -n ${{ inputs.namespace }} \
+            -n "$NAMESPACE" \
             --parameter runId=${{ github.run_id }}-${{ github.run_attempt }} \
             --parameter project=${{ inputs.project }} \
             --parameter testRevision=${{ inputs.image-tag }} \
@@ -94,7 +128,7 @@ jobs:
           set -euo pipefail
           name="${{ steps.submit.outputs.name }}"
           for i in $(seq 1 180); do
-            phase=$(argo get "$name" -n ${{ inputs.namespace }} -o json | jq -r '.status.phase // "Unknown"')
+            phase=$(argo get "$name" -n "$NAMESPACE" -o json | jq -r '.status.phase // "Unknown"')
             echo "poll $i: phase=$phase"
             if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ] || [ "$phase" = "Error" ]; then
               echo "phase=$phase" >> "$GITHUB_OUTPUT"
@@ -113,7 +147,7 @@ jobs:
       # group), regardless of how the wait step above ended.
       - name: Stop workflow on cancellation
         if: cancelled() && steps.submit.outputs.name != ''
-        run: argo stop "${{ steps.submit.outputs.name }}" -n ${{ inputs.namespace }} || true
+        run: argo stop "${{ steps.submit.outputs.name }}" -n "$NAMESPACE" || true
 
       # Same AWS credentials notifynl-full's bucket-provision-job.yaml
       # already uses to create this bucket in the first place (and that
@@ -137,7 +171,7 @@ jobs:
           # (that's set cluster-side by the argo namespace's
           # workflow-controller-configmap and not something this job should
           # need to know in advance).
-          argo get "$name" -n ${{ inputs.namespace }} -o json > wf.json
+          argo get "$name" -n "$NAMESPACE" -o json > wf.json
           download_artifact() {
             # $1 = artifact name, $2 = extraction dir. junit's tarball
             # contains a flat junit.xml (its source, /app/test-results/
