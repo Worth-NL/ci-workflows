@@ -79,6 +79,25 @@ jobs:
           fi
           echo "Targeting namespace: $NAMESPACE"
 
+      # Runs early, before anything writes results/ -- dorny/test-reporter
+      # (below) shells out to `git ls-files` to build check-run annotations,
+      # but this job never otherwise checks out a repo, since it only talks
+      # to Argo and S3. A plain checkout with no inputs defaults to the
+      # calling repo/commit (the `github` context inside a called workflow
+      # reflects the caller, not ci-workflows itself), which is exactly what
+      # the annotations should line up against. It must run before "Download
+      # artifacts from S3": actions/checkout defaults to clean: true (`git
+      # clean -ffdx`), which would silently wipe the downloaded
+      # results/junit and results/playwright-report files if it ran after --
+      # confirmed live, 2026-09-18: the S3 download succeeded but
+      # dorny/test-reporter and actions/upload-artifact both then found zero
+      # files, because checkout had run between them and cleaned them.
+      # `if: always()` matches the reporter step, so it still runs when an
+      # earlier step (e.g. the submit) already failed.
+      - name: Checkout caller repo
+        if: always()
+        uses: actions/checkout@v4
+
       # K8S_CONFIG is the same base64-encoded kubeconfig secret the calling
       # workflow's own `deploy` job already used via azure/k8s-set-context --
       # reused here rather than minting a separate credential, since it
@@ -194,18 +213,6 @@ jobs:
           mkdir -p results/junit
           download_artifact junit results/junit
           download_artifact playwright-report results
-
-      # dorny/test-reporter shells out to `git ls-files` to build check-run
-      # annotations, but this job never checks out a repo -- it only talks to
-      # Argo and S3, since it has no source of its own to run. A plain
-      # checkout with no inputs defaults to the calling repo/commit (the
-      # `github` context inside a called workflow reflects the caller, not
-      # ci-workflows itself), which is exactly what the annotations should
-      # line up against. `if: always()` matches the reporter step below, so
-      # it still runs when an earlier step (e.g. the submit) already failed.
-      - name: Checkout caller repo
-        if: always()
-        uses: actions/checkout@v4
 
       - uses: dorny/test-reporter@v2
         if: always()
