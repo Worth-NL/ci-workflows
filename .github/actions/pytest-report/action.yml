@@ -1,0 +1,62 @@
+name: PyTest report
+description: >-
+  Reports pytest's junit xml as a check run with dorny/test-reporter, with xfailed tests and NotifyNL's superseded
+  upstream tests counted separately in the title, badge and table. dorny itself only knows passed, failed and skipped,
+  and would count xfailed tests as skipped.
+
+inputs:
+  name:
+    description: Name of the check run
+    default: PyTest Tests
+  path:
+    description: Comma-separated junit xml files, globs allowed
+    default: reports/pytest-*.xml
+  badge-title:
+    description: Left-hand label of the badge
+    default: PYTEST
+  token:
+    description: Token that can write checks (checks:write)
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    # before dorny reads the reports: take the xfailed tests out and write our title and summary
+    - name: Split xfailed and superseded tests from the reports
+      id: prepare
+      shell: bash
+      env:
+        REPORT_PATH: ${{ inputs.path }}
+        BADGE_TITLE: ${{ inputs.badge-title }}
+        OUTPUT_FILE: ${{ runner.temp }}/pytest-report-output.json
+      run: python3 "$GITHUB_ACTION_PATH/prepare_report.py"
+
+    - uses: dorny/test-reporter@v2
+      id: dorny
+      if: ${{ !cancelled() }}
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        reporter: java-junit
+        only-summary: true
+        use-actions-summary: false
+        badge-title: ${{ inputs.badge-title }}
+        token: ${{ inputs.token }}
+
+    # dorny's title, badge and table only have passed, failed and skipped: replace them with ours. Annotations are kept,
+    # an update only appends to them. A failed update leaves dorny's report and only warns, it's not worth a red build.
+    - name: Add xfailed and superseded tests to the check run
+      if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.dorny.outputs.url != '' }}
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        URL: ${{ steps.dorny.outputs.url }}
+        OUTPUT_FILE: ${{ runner.temp }}/pytest-report-output.json
+      run: |
+        [ -f "$OUTPUT_FILE" ] || exit 0
+        response="$RUNNER_TEMP/pytest-report-response.json"
+        if ! curl --fail-with-body -sS -o "$response" -X PATCH "$URL" \
+          -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" --data "@$OUTPUT_FILE"; then
+          cat "$response"
+          echo "::warning::Couldn't add the xfailed and superseded counts to the check run"
+        fi
