@@ -2,6 +2,18 @@
 
 Reusable GitHub Actions workflows shared across NotifyNL repositories.
 
+## Reusable workflows
+
+Call a workflow from a job with `uses: Worth-NL/ci-workflows/.github/workflows/<file>@main`.
+Triggers and concurrency stay in the caller. The calling job must grant the permissions
+listed here: a called workflow cannot raise them.
+
+| File | Inputs | Permissions |
+|---|---|---|
+| `ghcr-cleanup.yml` | `package-name`, `keep-pr-tags` (10) | `contents: read`, `packages: write` |
+| `trivy-scan.yml` | `image`, `dockerfile`, `category` | `contents: read`, `security-events: write`, `actions: read` |
+| `run-smoke-tests.yml` | see the file; also needs `secrets: inherit` | `contents: read`, `checks: write`, `pull-requests: write` |
+
 ## Actions
 
 ### `pytest-report`
