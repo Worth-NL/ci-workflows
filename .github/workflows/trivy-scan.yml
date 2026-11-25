@@ -1,0 +1,67 @@
+name: Trivy scan (shared)
+
+# Builds the production image and uploads a Trivy SARIF report to the
+# caller's code scanning. Triggers stay in the calling workflow.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image name used to tag the local build
+        required: true
+        type: string
+      dockerfile:
+        required: false
+        type: string
+        default: docker/Dockerfile_nl
+      category:
+        description: >-
+          Code scanning category. The default is the one the per-repo trivy.yml
+          files produced, so existing alerts keep their history.
+        required: false
+        type: string
+        default: .github/workflows/trivy.yml:build
+
+jobs:
+  scan:
+    name: Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build production image
+        uses: docker/build-push-action@v6
+        with:
+          file: ${{ inputs.dockerfile }}
+          load: true
+          tags: ${{ inputs.image }}:${{ github.sha }}
+          platforms: linux/amd64
+          provenance: false
+          target: production
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: '${{ inputs.image }}:${{ github.sha }}'
+          scanners: 'vuln,misconfig,secret'
+          format: 'template'
+          template: '@/contrib/sarif.tpl'
+          output: 'trivy-results.sarif'
+          severity: 'UNKNOWN,LOW,MEDIUM,CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: ${{ inputs.category }}
