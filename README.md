@@ -12,9 +12,28 @@ listed here: a called workflow cannot raise them.
 |---|---|---|
 | `ghcr-cleanup.yml` | `package-name`, `keep-pr-tags` (10) | `contents: read`, `packages: write` |
 | `trivy-scan.yml` | `image`, `dockerfile`, `category` | `contents: read`, `security-events: write`, `actions: read` |
+| `trivy-fs-scan.yml` | `category` | `contents: read`, `security-events: write`, `actions: read` |
+| `build-image.yml` | `image`, `dockerfile`; output `tag` | `contents: read`, `packages: write` |
+| `deploy-test.yml` | `tag`, `image-keys`, `environment`, `environment-url`, `migration-revisions`, `dry-run-hints`, `failure-hints`; `secrets: inherit` | `contents: read`, `pull-requests: write` |
+| `release-image.yml` | `image`, `dockerfile`; `secrets: inherit` | `contents: read`, `packages: write` |
 | `run-smoke-tests.yml` | see the file; also needs `secrets: inherit` | `contents: read`, `checks: write`, `pull-requests: write` |
 
+A caller of `deploy-test.yml` must not set a workflow-level `cancel-in-progress`: it would
+cancel a running `helm upgrade`. Put concurrency on the other jobs instead.
+
 ## Actions
+
+Use as a step: `uses: Worth-NL/ci-workflows/.github/actions/<name>@main`. Inputs are described
+in each `action.yml`. Check out the repository first.
+
+| Action | Does |
+|---|---|
+| `python-setup` | System packages, uv, requirements, optional npm build, ruff |
+| `python-test` | Superseded-test check, pytest, report |
+| `docker-test` | Ruff and pytest inside the Dockerfile test stage |
+| `github-release` | GitHub release for a tag |
+| `helm-docs` | Regenerate and push chart docs |
+| `chart-release` | Add dependency repos and run chart-releaser |
 
 ### `pytest-report`
 

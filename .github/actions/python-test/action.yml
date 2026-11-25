@@ -1,0 +1,31 @@
+name: Python test
+description: Superseded-test check, pytest and the pytest report. The job needs `checks write`.
+
+inputs:
+  pytest:
+    description: Command that runs pytest
+    default: uv run pytest
+  verify-superseded:
+    description: Check superseded_tests_nl.toml first
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Check superseded_tests_nl.toml
+      if: inputs.verify-superseded == 'true'
+      shell: bash
+      env:
+        PYTEST: ${{ inputs.pytest }}
+      run: $PYTEST --collect-only -qq --nl-verify
+
+    - uses: pavelzw/pytest-action@v2
+      with:
+        job-summary: false
+        verbose: false
+        emoji: false
+        custom-arguments: --junitxml=reports/pytest-unit.xml
+        custom-pytest: ${{ inputs.pytest }}
+
+    - uses: Worth-NL/ci-workflows/.github/actions/pytest-report@main
+      if: ${{ !cancelled() }}

@@ -1,0 +1,72 @@
+name: Python setup
+description: Timezone, system packages, uv, test requirements, optional npm build, ruff and version file. Check out first.
+
+inputs:
+  python-version:
+    default: "3.13"
+  requirements:
+    description: Test requirements file, also pins ruff
+    default: requirements_nl_test.txt
+  cache-dependency-glob:
+    default: requirements_nl.txt
+  uv-sync:
+    description: Run `uv sync` before installing the requirements
+    default: "false"
+  node-version:
+    description: Set to install Node, run `npm ci` and `npm run build`
+    default: ""
+  version-file:
+    description: Run `make generate-version-file`
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - uses: szenius/set-timezone@v2.0
+      with:
+        timezoneLinux: "Europe/Amsterdam"
+
+    - uses: gerlero/apt-install@v1
+      with:
+        packages: build-essential git libcurl4-openssl-dev curl libssl-dev
+        install-recommends: false
+
+    - uses: actions/setup-node@v4
+      if: inputs.node-version != ''
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+
+    - uses: astral-sh/setup-uv@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+        activate-environment: true
+        enable-cache: true
+        cache-dependency-glob: ${{ inputs.cache-dependency-glob }}
+
+    - name: Sync project (uv)
+      if: inputs.uv-sync == 'true'
+      shell: bash
+      run: uv sync
+
+    - name: Install application requirements
+      shell: bash
+      env:
+        REQUIREMENTS: ${{ inputs.requirements }}
+      run: uv pip install -r "$REQUIREMENTS"
+
+    - name: NPM install and build
+      if: inputs.node-version != ''
+      shell: bash
+      run: |
+        npm ci --no-audit
+        npm run build
+
+    - uses: astral-sh/ruff-action@v3
+      with:
+        version-file: ${{ inputs.requirements }}
+
+    - name: Generate version file
+      if: inputs.version-file == 'true'
+      shell: bash
+      run: make generate-version-file

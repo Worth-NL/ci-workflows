@@ -1,0 +1,45 @@
+name: Trivy source scan (shared)
+
+# Scans the checked-out source (no image) and uploads a SARIF report.
+
+on:
+  workflow_call:
+    inputs:
+      category:
+        description: >-
+          Code scanning category. The default is the one the per-repo trivy.yml
+          files produced, so existing alerts keep their history.
+        required: false
+        type: string
+        default: .github/workflows/trivy.yml:scan
+
+jobs:
+  scan:
+    name: Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'vuln,secret'
+          format: 'template'
+          template: '@/contrib/sarif.tpl'
+          output: 'trivy-results.sarif'
+          severity: 'UNKNOWN,LOW,MEDIUM,CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: ${{ inputs.category }}
