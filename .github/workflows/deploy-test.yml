@@ -1,0 +1,196 @@
+name: Deploy to Test (shared)
+
+# Upgrades the shared notifynl Helm release with new image tags: dry-run first,
+# then the real upgrade, with a PR comment if either fails.
+#
+# The caller passes `secrets: inherit`. K8S_CONFIG and NAMESPACE are
+# environment-scoped, so they resolve through the job's `environment`.
+#
+# The job is never cancelled by a newer run: cancelling `helm upgrade` leaves the
+# release in pending-upgrade and blocks every later deploy. This only holds if
+# the caller has no workflow-level `cancel-in-progress`.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Image tag to deploy
+        required: true
+        type: string
+      image-keys:
+        description: Values paths that get `.image.tag`, one per line
+        required: true
+        type: string
+      environment:
+        required: false
+        type: string
+        default: Test
+      environment-url:
+        required: false
+        type: string
+        default: ""
+      migration-revisions:
+        description: Set migrations.apiUpgrade revisions from the caller's migration folders (API only)
+        required: false
+        type: boolean
+        default: false
+      dry-run-hints:
+        description: Markdown added to the PR comment when the dry-run fails
+        required: false
+        type: string
+        default: >-
+          Most likely cause: `notifynl-full` added a value with no chart default that this release doesn't have
+          set yet. Seed it once with a manual `helm upgrade --set <key>=<value>`; later deploys carry it forward.
+      failure-hints:
+        description: Markdown added to the PR comment when the upgrade fails
+        required: false
+        type: string
+        default: |-
+          Check the test env k8s state and logs, and whether the Helm release needs a rollback.
+
+          Most likely causes:
+          - Package visibility
+          - ghcr.io credentials expiration or change
+
+jobs:
+  helm:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-test
+      cancel-in-progress: false
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.environment-url }}
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      NAMESPACE: ${{ vars.NAMESPACE }}
+
+    steps:
+      # Must run first: it targets the workspace root and cleans it.
+      - name: Checkout Worth-NL/notifynl-charts-private
+        uses: actions/checkout@v4
+        with:
+          repository: Worth-NL/notifynl-charts-private
+          ref: main
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Checkout caller (migration folders)
+        if: inputs.migration-revisions
+        uses: actions/checkout@v4
+        with:
+          path: caller
+
+      - name: Build helm arguments
+        env:
+          TAG: ${{ inputs.tag }}
+          IMAGE_KEYS: ${{ inputs.image-keys }}
+          MIGRATIONS: ${{ inputs.migration-revisions }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NAMESPACE" ]; then
+            echo "::error::No NAMESPACE variable on this environment"
+            exit 1
+          fi
+          args="$RUNNER_TEMP/helm-args"
+          : > "$args"
+          for key in $IMAGE_KEYS; do
+            printf -- '--set\n%s.image.tag=%s\n' "$key" "$TAG" >> "$args"
+          done
+          # A PR image can bundle newer migrations than the chart's pinned
+          # revisions, so take both heads from this PR (sorted, last file wins).
+          if [ "$MIGRATIONS" = "true" ]; then
+            # shellcheck disable=SC2012
+            alphagov=$(basename "$(ls caller/migrations/versions/*.py | sort | tail -1)" .py)
+            # shellcheck disable=SC2012
+            nl=$(basename "$(ls caller/migrations_nl/versions/*.py | sort | tail -1)" .py | cut -d_ -f1)
+            printf -- '--set\nmigrations.apiUpgrade.alphagovRevision=%s\n' "$alphagov" >> "$args"
+            printf -- '--set\nmigrations.apiUpgrade.nlRevision=%s\n' "$nl" >> "$args"
+          fi
+          cat "$args"
+
+      # K8S_CONFIG is stored base64-encoded; k8s-set-context wants raw YAML.
+      - name: Decode kubeconfig
+        id: decode-kubeconfig
+        run: |
+          {
+            echo "content<<KUBECONFIG_EOF"
+            echo "${{ secrets.K8S_CONFIG }}" | base64 -d
+            echo "KUBECONFIG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ steps.decode-kubeconfig.outputs.content }}
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.2
+
+      - name: Helm chart dependency update
+        run: helm dependency update
+        working-directory: ${{ github.workspace }}/notifynl-full
+
+      # Same flags as the real deploy. stdout holds rendered Secrets: discard it.
+      - name: Pre-flight validation (dry-run, no cluster mutation)
+        id: helm-dry-run
+        run: |
+          mapfile -t args < "$RUNNER_TEMP/helm-args"
+          set -x
+          helm upgrade --install notifynl notifynl-full/ \
+            -n "$NAMESPACE" \
+            --reset-then-reuse-values \
+            "${args[@]}" \
+            --rollback-on-failure \
+            --dry-run=server \
+            > /dev/null
+
+      - name: Deploy new tag
+        id: helm-deploy
+        run: |
+          mapfile -t args < "$RUNNER_TEMP/helm-args"
+          set -x
+          helm upgrade --install notifynl notifynl-full/ \
+            -n "$NAMESPACE" \
+            --reset-then-reuse-values \
+            "${args[@]}" \
+            --rollback-on-failure \
+            --timeout 300s
+
+      - name: Comment on PR if deployment fails
+        if: failure() && (steps.helm-dry-run.outcome == 'failure' || steps.helm-deploy.outcome == 'failure') && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          DRY_RUN_OUTCOME: ${{ steps.helm-dry-run.outcome }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TAG: ${{ inputs.tag }}
+          DRY_RUN_HINTS: ${{ inputs.dry-run-hints }}
+          FAILURE_HINTS: ${{ inputs.failure-hints }}
+        with:
+          script: |
+            const { DRY_RUN_OUTCOME, ENVIRONMENT, TAG, DRY_RUN_HINTS, FAILURE_HINTS } = process.env;
+            const dryRunFailed = DRY_RUN_OUTCOME === "failure";
+            const body = [
+              dryRunFailed
+                ? "⚠️ **Test environment deployment blocked (pre-flight check failed)**"
+                : "❌ **Test environment deployment failed**",
+              "",
+              `- Environment: \`${ENVIRONMENT}\``,
+              `- Image tag: \`${TAG}\``,
+              "",
+              dryRunFailed
+                ? "The pre-flight `helm upgrade --dry-run=server` check failed, so the real deploy never ran — **the cluster was not touched**."
+                : "The pre-flight check passed but the real deploy failed. `--rollback-on-failure` makes Helm attempt a rollback; confirm it succeeded.",
+              "",
+              "Check the workflow logs for the Helm error output.",
+              "",
+              dryRunFailed ? DRY_RUN_HINTS : FAILURE_HINTS
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });

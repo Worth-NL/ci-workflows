@@ -1,0 +1,59 @@
+name: Docker test
+description: >-
+  Ruff, then pytest inside the Dockerfile's test stage, so tests use the same system libraries as production.
+  Check out first. The job needs `checks write`.
+
+inputs:
+  image:
+    description: Local tag for the test image
+    required: true
+  dockerfile:
+    default: docker/Dockerfile_nl
+  requirements:
+    description: Requirements file that pins ruff
+    default: requirements_nl_test.txt
+  env-names:
+    description: Space-separated names of job env variables to pass into the container
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/ruff-action@v3
+      with:
+        version-file: ${{ inputs.requirements }}
+
+    - uses: docker/setup-buildx-action@v3
+
+    - uses: docker/build-push-action@v6
+      with:
+        file: ${{ inputs.dockerfile }}
+        target: test
+        load: true
+        tags: ${{ inputs.image }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Check superseded_tests_nl.toml
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+      run: docker run --rm --entrypoint pytest "$IMAGE" --collect-only -qq --nl-verify
+
+    - name: Run unit tests
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        ENV_NAMES: ${{ inputs.env-names }}
+      run: |
+        args=(-e TZ=Europe/Amsterdam)
+        for name in $ENV_NAMES; do args+=(-e "$name"); done
+        docker run --name unit-tests "${args[@]}" --entrypoint pytest "$IMAGE" --junitxml=reports/pytest-unit.xml
+
+    - name: Copy test report out of the container
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: docker cp unit-tests:/home/vcap/app/reports ./reports
+
+    - uses: Worth-NL/ci-workflows/.github/actions/pytest-report@main
+      if: ${{ !cancelled() }}

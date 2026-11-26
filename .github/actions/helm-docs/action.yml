@@ -1,0 +1,12 @@
+name: Helm docs
+description: Regenerates chart documentation and pushes it. Check out the target branch first; needs `contents write`.
+
+runs:
+  using: composite
+  steps:
+    - uses: losisin/helm-docs-github-action@v1
+      with:
+        git-push: true
+        git-push-user-name: ${{ github.actor }}
+        git-push-user-email: ${{ github.actor }}@users.noreply.github.com
+        git-commit-message: "🧹 update chart documentation"

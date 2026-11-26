@@ -1,0 +1,56 @@
+name: Release image (shared)
+
+# Pushes the production image on merge: -dev tag on develop, release on main.
+# The caller passes `secrets: inherit` (RELEASE_TOKEN).
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Full image name, e.g. ghcr.io/worth-nl/notifynl-api
+        required: true
+        type: string
+      dockerfile:
+        required: false
+        type: string
+        default: docker/Dockerfile_nl
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: https://ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Set tag
+        id: set-tag
+        run: |
+          TAG=$(date +%Y%m%d).${{ github.run_number }}
+          if [ "${{ github.ref_name }}" = "develop" ]; then TAG="$TAG-dev"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ inputs.image }}:${{ steps.set-tag.outputs.tag }}
+          platforms: linux/amd64
+          provenance: false
+          target: production
+
+      - name: Release
+        if: github.ref_name == 'main'
+        uses: Worth-NL/ci-workflows/.github/actions/github-release@main
+        with:
+          tag: ${{ steps.set-tag.outputs.tag }}
+          token: ${{ secrets.RELEASE_TOKEN }}

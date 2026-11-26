@@ -1,0 +1,19 @@
+name: GitHub release
+description: Creates the latest GitHub release for a tag, with generated notes.
+
+inputs:
+  tag:
+    required: true
+  token:
+    description: Token that can create releases
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ inputs.tag }}
+        make_latest: true
+        token: ${{ inputs.token }}
+        generate_release_notes: true

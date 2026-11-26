@@ -1,0 +1,33 @@
+name: Chart release
+description: >-
+  Adds the charts' dependency repositories and runs chart-releaser. Check out with fetch-depth 0 first; needs
+  `contents write`. Signing is set up by the caller through CR_* job env variables.
+
+inputs:
+  token:
+    description: Token for chart-releaser
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Configure Git
+      shell: bash
+      run: |
+        git config user.name "$GITHUB_ACTOR"
+        git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+    - uses: azure/setup-helm@v4
+
+    - name: Add chart dependency repos
+      shell: bash
+      run: |
+        yq -N '.dependencies[].repository' */Chart.yaml | { grep -E '^https?://' || true; } | sort -u |
+          while read -r url; do helm repo add "$(echo -n "$url" | sha1sum | cut -c1-8)" "$url"; done
+
+    - uses: helm/chart-releaser-action@v1
+      with:
+        charts_dir: "./"
+        skip_existing: true
+      env:
+        CR_TOKEN: ${{ inputs.token }}
