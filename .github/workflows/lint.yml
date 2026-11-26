@@ -16,3 +16,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+
+  # Every merge to main that passes lint gets a tag: a known point to go back to.
+  tag:
+    if: github.event_name == 'push'
+    needs: actionlint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Tag the merge commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(date +%Y%m%d).${{ github.run_number }}"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA"
+          echo "Tagged $GITHUB_SHA as $tag" >> "$GITHUB_STEP_SUMMARY"

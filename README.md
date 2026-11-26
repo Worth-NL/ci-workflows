@@ -61,3 +61,19 @@ GitHub only allows a private repository's reusable workflows to be consumed by
 
 No test code or credentials live here. Secrets are supplied by the caller via
 `secrets: inherit`; the data stays private in the private caller repos.
+
+## Tags (failsafe)
+
+Callers use `@main`. Every merge that passes lint is tagged `YYYYMMDD.<run>`, as a point to go back to.
+
+If a merge breaks callers, restore `main` from the last good tag with a pull request. This fixes every
+repository at once:
+
+```bash
+git switch -c fix/restore-ci origin/main
+git restore --source <tag> -- .github
+git commit -m "fix: restore workflows from <tag>"
+```
+
+Pointing a single caller at `@<tag>` is only a partial pin: shared files call each other at `@main`
+(`pytest-report`, `github-release`).
